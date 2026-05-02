@@ -566,8 +566,8 @@ async def reply(body: ReplyBody):
     conv = conversation_turns.setdefault(body.conversation_id, [])
     conv.append({"from": body.from_role, "message": body.message, "received_at": body.received_at})
 
-    msg = body.message or ""
-    msg_norm = msg.strip().lower()
+    msg = (body.message or "").strip()
+    msg_norm = msg.lower()
     merchant_key = (body.merchant_id or "unknown").strip()
 
     # Hard opt-out / hostile
@@ -576,8 +576,6 @@ async def reply(body: ReplyBody):
 
     # Auto-reply handling (escalate: nudge once, then wait, then end)
     if _is_auto_reply(msg):
-        # The judge simulator may send auto-replies across *different* conversation_ids,
-        # so track repeats per-merchant per-message globally.
         k = (merchant_key, msg_norm)
         auto_reply_counts[k] = auto_reply_counts.get(k, 0) + 1
         repeats = auto_reply_counts[k]
@@ -597,17 +595,89 @@ async def reply(body: ReplyBody):
             "rationale": "Detected explicit commitment; switching from qualifying to action with a concrete next step.",
         }
 
-    # Default: short acknowledgement + one focused question
+    # Lightweight intent detection + context awareness
+    yes_re = re.compile(r"\b(yes|yep|y|sure|confirm|ok|1|reply\s*yes|please do)\b")
+    no_re = re.compile(r"\b(no|nah|not now|cancel|2|don't|dont)\b")
+    slot_choice_re = re.compile(r"\b([12])\b")
+    draft_re = re.compile(r"\b(draft|post|whatsapp|google post|draft it|send.*draft)\b")
+
+    is_yes = bool(yes_re.search(msg_norm))
+    is_no = bool(no_re.search(msg_norm))
+    slot_choice_m = slot_choice_re.search(msg_norm)
+    slot_choice = int(slot_choice_m.group(1)) if slot_choice_m else None
+    is_draft = bool(draft_re.search(msg_norm))
+
+    # Try to infer trigger id from conversation id (tick uses conv_{merchant_id}_{trigger_id})
+    trigger = None
+    try:
+        if body.conversation_id.startswith("conv_") and "_" in body.conversation_id:
+            trg_id = body.conversation_id.rsplit("_", 1)[-1]
+            trigger = _get("trigger", trg_id)
+    except Exception:
+        trigger = None
+
+    merchant = _get("merchant", body.merchant_id) if body.merchant_id else None
+    category = _get("category", (merchant.get("category_slug") if merchant else None)) if merchant else None
+    customer = _get("customer", body.customer_id) if body.customer_id else None
+
+    # If the last outbound action invited a YES/NO and user said YES, produce the concrete draft
+    if is_yes and trigger:
+        composed = compose_action(category or {}, merchant or {}, trigger or {}, customer)
+        # If CTA was binary or open-ended where a draft makes sense, send the draft
+        return {
+            "action": "send",
+            "body": f"Okay — here’s a draft you can use:\n\n{composed.get('body')}",
+            "cta": "open_ended",
+            "rationale": "User affirmed (YES) and trigger context exists; returning a draft based on trigger + merchant context.",
+        }
+
+    # Slot selection for customer-scoped triggers (e.g., recall_due)
+    if slot_choice and trigger and trigger.get("scope") == "customer":
+        payload = trigger.get("payload") or {}
+        slots = (payload.get("available_slots") or [])[:3]
+        idx = slot_choice - 1
+        if 0 <= idx < len(slots):
+            chosen = slots[idx]
+            label = chosen.get("label") or str(chosen)
+            who = (customer.get("identity", {}) or {}).get("name") if customer else "there"
+            clinic = _merchant_display_name(merchant) if merchant else "the clinic"
+            return {
+                "action": "send",
+                "body": f"Confirmed — booking {label} for {who}. I’ll notify {clinic} and hold this slot.",
+                "cta": "open_ended",
+                "rationale": "User selected a slot from the customer-scoped trigger; booking acknowledged.",
+            }
+        else:
+            # invalid slot index
+            return {"action": "send", "body": "I couldn't find that slot — reply 1 or 2 to pick a slot.", "cta": "multi_choice_slot", "rationale": "Invalid slot choice."}
+
+    # If user asked for a draft explicitly, attempt to build one from trigger context
+    if is_draft and trigger:
+        composed = compose_action(category or {}, merchant or {}, trigger or {}, customer)
+        return {"action": "send", "body": composed.get("body"), "cta": "open_ended", "rationale": "User asked for a draft; returning a context-aware draft."}
+
+    # If user said NO explicitly, acknowledge and close or ask for next preference
+    if is_no:
+        return {"action": "send", "body": "No problem — what would you prefer instead? More calls, more walk-ins, or more repeat customers?", "cta": "open_ended", "rationale": "User declined; asking for alternative priority."}
+
+    # Fallback: use merchant/customer context to make the acknowledgement less generic
+    who = None
+    if customer:
+        who = (customer.get("identity", {}) or {}).get("name")
+    if not who and merchant:
+        who = _merchant_first_name(merchant) or _merchant_display_name(merchant)
+    who = who or "there"
+
     last_bot = conversation_last_bot_body.get(body.conversation_id, "")
-    response_body = "Got it. What should I prioritize right now — more calls, more walk-ins, or more repeat customers?"
+    response_body = f"Got it, {who}. What should I prioritize right now — more calls, more walk-ins, or more repeat customers?"
     if response_body.strip() == last_bot.strip():
-        response_body = "Understood. Tell me your top priority (calls / walk-ins / repeat) and I’ll draft the next message accordingly."
+        response_body = f"Understood, {who}. Tell me your top priority (calls / walk-ins / repeat) and I’ll draft the next message accordingly."
     conversation_last_bot_body[body.conversation_id] = response_body
 
     return {
         "action": "send",
         "body": response_body,
         "cta": "open_ended",
-        "rationale": "Acknowledged the reply and asked one low-friction question to route the next action.",
+        "rationale": "Acknowledged the reply and asked one low-friction question to route the next action (context-aware).",
     }
 
