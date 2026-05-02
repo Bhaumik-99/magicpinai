@@ -477,6 +477,13 @@ def compose_action(
         "rationale": rationale,
     }
 
+@app.get("/")
+def root():
+    return {
+        "message": "Magicpin AI API is live 🚀",
+        "docs": "/docs",
+        "health": "/v1/healthz"
+    }
 
 @app.get("/v1/healthz")
 async def healthz():
