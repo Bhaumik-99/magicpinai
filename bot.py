@@ -660,6 +660,15 @@ async def reply(body: ReplyBody):
     if is_no:
         return {"action": "send", "body": "No problem — what would you prefer instead? More calls, more walk-ins, or more repeat customers?", "cta": "open_ended", "rationale": "User declined; asking for alternative priority."}
 
+    # Quick food/order intent shortcut
+    if "food" in msg_norm or "order" in msg_norm:
+        return {
+            "action": "send",
+            "body": "Nice! What would you like to order — pizza, burgers, or something else?",
+            "cta": "suggest_options",
+            "rationale": "Detected food ordering intent",
+        }
+
     # Fallback: use merchant/customer context to make the acknowledgement less generic
     who = None
     if customer:
